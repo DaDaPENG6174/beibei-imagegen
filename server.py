@@ -27,7 +27,7 @@ API_KEY = "sk-your-key-here"
 MODEL = "gpt-image-2.6-flare"
 VISION_MODEL = "gpt-5.6-luna"   # 看图模型：产品档案提取、生成结果质检（防幻觉流程用）
 HOST = "127.0.0.1"
-PORT = 8710
+PORT = 8710               # 可在 config.json 里加 "port": 端口号 覆盖
 OPEN_BROWSER = True       # 启动后自动打开浏览器
 TIMEOUT = 300             # 单次生成超时（秒）
 
@@ -41,6 +41,36 @@ CONTENT_TRIES = 3         # 出图后硬校验（透明底/重复视图）不过
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = "index.html"
+CONFIG_FILE = os.path.join(HERE, "config.json")   # 页面里「重新配置」保存的设置，优先于上面的默认值
+
+
+def load_config():
+    """读取 config.json（如果有），覆盖上面的默认配置"""
+    global API_BASE, API_KEY, MODEL, VISION_MODEL, PORT
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        return
+    API_BASE = str(c.get("api_base") or API_BASE).rstrip("/")
+    API_KEY = str(c.get("api_key") or API_KEY)
+    MODEL = str(c.get("model") or MODEL)
+    VISION_MODEL = str(c.get("vision_model") or VISION_MODEL)
+    if isinstance(c.get("port"), int) and 1024 < c["port"] < 65536:
+        PORT = c["port"]
+
+
+def save_config(api_base, api_key, model, vision_model):
+    global API_BASE, API_KEY, MODEL, VISION_MODEL
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"api_base": api_base, "api_key": api_key, "model": model,
+                   "vision_model": vision_model}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+    API_BASE, API_KEY, MODEL, VISION_MODEL = api_base, api_key, model, vision_model
+
+
+load_config()
 
 
 def log(msg):
@@ -156,12 +186,16 @@ def build_multipart(fields, files):
     return b"".join(out), "multipart/form-data; boundary=" + boundary
 
 
-def call_edit(images, prompt, size):
+def call_edit(images, prompt, size, mask=None):
     """有参考图 → /images/edits（multipart）。images = [(文件名, mime, 字节), ...]
-    第 1 张是原始产品照（权威参考），第 2 张（可选）是已确认的前视图（只用来对齐设计）。"""
+    第 1 张是原始产品照（权威参考），第 2 张（可选）是已确认的前视图（只用来对齐设计）。
+    mask（可选）：PNG 字节，透明处为允许重画的区域，作用于第 1 张图（区域重制用）。"""
     fields = {"model": MODEL, "prompt": prompt, "n": "1", "size": size}
     field = "image[]" if len(images) > 1 else "image"
-    body, ctype = build_multipart(fields, [(field, fn, mime, blob) for fn, mime, blob in images])
+    parts = [(field, fn, mime, blob) for fn, mime, blob in images]
+    if mask:
+        parts.append(("mask", "mask.png", "image/png", mask))
+    body, ctype = build_multipart(fields, parts)
     h = _auth_headers()
     h["Content-Type"] = ctype
 
@@ -208,7 +242,7 @@ def call_generate(prompt, size):
 
 # ---------- 出图后的硬校验（不靠模型，用代码判断） ----------
 try:
-    from PIL import Image, ImageChops, ImageStat
+    from PIL import Image, ImageChops, ImageFilter, ImageStat
     import io
     HAVE_PIL = True
 except Exception:          # 没装 Pillow 就跳过校验，不影响出图
@@ -270,6 +304,34 @@ def inspect_image(blob, anchor_blob=None):
         return blob, None, []
 
 
+MASK_GROW = 6               # 区域重制：划圈区域向外扩几像素，盖住接缝
+MASK_FEATHER = 4            # 再羽化几像素，让新旧像素自然过渡
+API_SIZES = ("1024x1024", "1536x1024", "1024x1536")
+
+
+def region_alpha(mask_blob, size):
+    """前端遮罩（透明 = 要重画）→ L 通道：255 = 重画，0 = 保持原样。并返回扩边羽化后的版本。"""
+    m = Image.open(io.BytesIO(mask_blob)).convert("RGBA")
+    if m.size != size:
+        m = m.resize(size, Image.NEAREST)
+    region = m.getchannel("A").point(lambda a: 255 if a < 128 else 0)
+    soft = region
+    if MASK_GROW:
+        soft = soft.filter(ImageFilter.MaxFilter(MASK_GROW * 2 + 1))
+    if MASK_FEATHER:
+        soft = soft.filter(ImageFilter.GaussianBlur(MASK_FEATHER))
+    return region, soft
+
+
+def api_mask(region):
+    """给上游接口的遮罩：与第 1 张图同尺寸的 RGBA，要重画的区域 alpha=0"""
+    out = Image.new("RGBA", region.size, (0, 0, 0, 255))
+    out.putalpha(region.point(lambda a: 0 if a else 255))
+    buf = io.BytesIO()
+    out.save(buf, "PNG")
+    return buf.getvalue()
+
+
 RETRY_HINT = {
     "transparent": " IMPORTANT: the previous attempt had a transparent or cut-out background. "
                    "This time render a fully opaque seamless ivory-to-beige gradient background, no alpha, no cutout edges.",
@@ -282,6 +344,7 @@ FLAG_TEXT = {"transparent": "背景透明/有抠图残边", "duplicate": "与前
 
 def parse_multipart(raw, boundary):
     fields, files = {}, {}
+    files_multi = {}          # 同名字段收集为列表（区域重制之外的 refs 多图参考）
     delim = b"--" + boundary.encode()
     for ch in raw.split(delim):
         if not ch or ch in (b"--\r\n", b"--", b"\r\n"):
@@ -300,11 +363,18 @@ def parse_multipart(raw, boundary):
         fn_m = re.search(r'filename="([^"]*)"', head_txt)
         ct_m = re.search(r"Content-Type:\s*([^\r\n]+)", head_txt, re.I)
         if fn_m:
-            files[name] = (fn_m.group(1) or "image.png",
-                           (ct_m.group(1).strip() if ct_m else "image/png"),
-                           body)
+            item = (fn_m.group(1) or "image.png",
+                    (ct_m.group(1).strip() if ct_m else "image/png"),
+                    body)
+            if name == "refs":                      # 只有多参考字段允许重复
+                files_multi.setdefault("refs", []).append(item)
+            elif name in files:
+                files[name] = item                  # 其余字段沿用旧语义：后者覆盖
+            else:
+                files[name] = item
         else:
             fields[name] = body.decode("utf-8", "replace")
+    files.update(files_multi)
     return fields, files
 
 
@@ -353,6 +423,10 @@ class Handler(BaseHTTPRequestHandler):
                 "modelReady": (MODEL in ids) if ids else False,
                 "detail": detail,
             })
+        elif p == "/api/config":
+            # 不回传 Key，只告诉页面有没有配置
+            self._json({"api_base": API_BASE, "model": MODEL, "vision_model": VISION_MODEL,
+                        "has_key": bool(API_KEY) and API_KEY != "sk-your-key-here"})
         elif p.startswith("/api/"):
             self._json({"error": "未知接口"}, 404)
         else:
@@ -366,8 +440,120 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_analyze()
         elif p == "/api/check":
             self._handle_check()
+        elif p == "/api/config":
+            self._handle_config()
+        elif p == "/api/inpaint":
+            self._handle_inpaint()
         else:
             self._json({"error": "未知接口"}, 404)
+
+    def _handle_config(self):
+        """页面「重新配置」：保存接口地址、Key、模型。只接受本页面发来的请求。"""
+        origin = self.headers.get("Origin")
+        host = self.headers.get("Host", "")
+        if origin and origin not in ("http://" + host,):
+            self._json({"error": "只允许本机页面修改配置"}, 403)
+            return
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        except ValueError:
+            self._json({"error": "请求格式不对"}, 400)
+            return
+        base = str(body.get("api_base") or "").strip().rstrip("/")
+        model = str(body.get("model") or "").strip()
+        vision = str(body.get("vision_model") or "").strip()
+        key = str(body.get("api_key") or "").strip() or API_KEY   # 留空 = 保留原 Key
+        if not re.match(r"^https?://[^\s/]+", base):
+            self._json({"error": "接口地址要以 http:// 或 https:// 开头"}, 400)
+            return
+        if not model or not vision:
+            self._json({"error": "生图模型和看图模型都要填"}, 400)
+            return
+        save_config(base, key, model, vision)
+        log("配置已更新：%s / %s / %s" % (API_BASE, MODEL, VISION_MODEL))
+        self._json({"ok": True})
+
+    def _handle_inpaint(self):
+        """区域重制：只重画用户划圈的区域，其余像素由本服务按原图逐像素保留。
+
+        表单：base（要修改的生成图）、marked（带红圈的同一张图）、reference（原始产品照）、
+              mask（PNG，透明 = 划圈区域）、prompt、size
+        """
+        if not HAVE_PIL:
+            self._json({"error": "区域重制需要 Pillow：请在命令行运行 pip install pillow 后重启"}, 500)
+            return
+        fields, files = self._read_form()
+        if files is None:
+            return
+        base, marked, ref, mask = (files.get(k) for k in ("base", "marked", "reference", "mask"))
+        prompt = (fields.get("prompt") or "").strip()
+        if not (base and marked and ref and mask) or not prompt:
+            self._json({"error": "缺少图片、划圈区域或提示词"}, 400)
+            return
+        try:
+            base_im = _flat_rgb(Image.open(io.BytesIO(base[2])))
+            region, soft = region_alpha(mask[2], base_im.size)
+        except Exception as e:
+            self._json({"error": "图片或划圈区域无法读取：%s" % e}, 400)
+            return
+        if not region.getbbox():
+            self._json({"error": "没有划出区域，请先在图上圈出要重制的部分"}, 400)
+            return
+
+        buf = io.BytesIO()
+        base_im.save(buf, "PNG")
+        size = "%dx%d" % base_im.size
+        if size not in API_SIZES:
+            size = (fields.get("size") or "").strip() or "auto"
+        refs = [("current.png", "image/png", buf.getvalue()),
+                (marked[0] or "marked.png", marked[1], marked[2]),
+                (ref[0] or "reference.jpg", ref[1], ref[2])]
+        t0 = time.time()
+        data, err, tries = call_edit(refs, prompt, size, api_mask(region))
+        mask_used = True
+        if err and "HTTP 400" in err:
+            # 部分中转站不支持 mask 字段：改为只靠提示词和红圈定位，区域外仍由本服务保证不变
+            log("上游拒绝了遮罩参数（%s），改为不带遮罩重试" % err)
+            data, err, more = call_edit(refs, prompt, size)
+            tries += more
+            mask_used = False
+        if err:
+            self._json({"error": err}, 502)
+            return
+        items = (data or {}).get("data") or []
+        if not items or not (items[0].get("b64_json") or items[0].get("url")):
+            self._json({"error": "接口返回了空结果"}, 502)
+            return
+        try:
+            if items[0].get("b64_json"):
+                blob = base64.b64decode(items[0]["b64_json"])
+            else:
+                req = urllib.request.Request(items[0]["url"], headers={"User-Agent": "JinxiangStudio/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    blob = r.read()
+            gen = _flat_rgb(Image.open(io.BytesIO(blob)))
+        except Exception as e:
+            self._json({"error": "生图结果无法读取：%s" % e}, 502)
+            return
+        if gen.size != base_im.size:
+            gen = gen.resize(base_im.size, Image.LANCZOS)
+
+        # 只取划圈区域（扩边 + 羽化）内的新像素，区域外一律用原图像素
+        out = Image.composite(gen, base_im, soft)
+        outside = soft.point(lambda a: 255 if a == 0 else 0)
+        diff = ImageChops.difference(out, base_im).convert("L")
+        changed_outside = ImageStat.Stat(diff, mask=outside).sum[0] > 0
+        buf = io.BytesIO()
+        out.save(buf, "PNG")
+        x0, y0, x1, y1 = region.getbbox()
+        log("区域重制完成，用时 %.0f 秒，区域 %dx%d，遮罩参数%s"
+            % (time.time() - t0, x1 - x0, y1 - y0, "已使用" if mask_used else "未被接口支持"))
+        self._json({
+            "image": "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(),
+            "retries": tries, "mask_used": mask_used,
+            "outside_unchanged": not changed_outside,
+            "region": [x0, y0, x1, y1],
+        })
 
     def _read_form(self):
         ctype = self.headers.get("Content-Type", "")
@@ -442,13 +628,22 @@ class Handler(BaseHTTPRequestHandler):
         if not m:
             self._json({"error": "缺少 boundary"}, 400)
             return
-        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 60 * 1048576:
+            self._json({"error": "请求太大：原图加参考图请控制在 60MB 内"}, 400)
+            return
+        raw = self.rfile.read(length)
         fields, files = parse_multipart(raw, m.group(1).strip('"'))
 
         prompt = (fields.get("prompt") or "").strip()
         size = (fields.get("size") or "").strip() or "1024x1024"
         img = files.get("image")
         anchor = files.get("anchor")      # 可选：已确认的前视图，用来对齐设计
+        extra_refs = [r for r in (files.get("refs") or []) if r[2]][:4]   # 可选：其他视角实拍，最多 4 张
+        for r in extra_refs:
+            if len(r[2]) > 15 * 1048576:
+                self._json({"error": "单张参考图超过 15MB，请先压缩"}, 400)
+                return
 
         if not prompt:
             self._json({"error": "缺少提示词"}, 400)
@@ -467,7 +662,9 @@ class Handler(BaseHTTPRequestHandler):
             # 上游偶尔返回空 data，这种也值得再要一次
             for attempt in range(1, TRIES + 1):
                 if img and img[2]:
+                    # 顺序：第一参考（权威）→ 其他视角实拍 → 已确认的前视图（只对齐设计）
                     refs = [(img[0], img[1], img[2])]
+                    refs += [(r[0], r[1], r[2]) for r in extra_refs]
                     if anchor_blob:
                         refs.append((anchor[0], anchor[1], anchor[2]))
                     data, err, tries = call_edit(refs, cur_prompt, size)

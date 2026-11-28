@@ -47,6 +47,15 @@ def read_cfg():
             m = re.search(r'^%s\s*=\s*(\d+)' % k, src, re.M)
             if m:
                 CFG[k] = m.group(1)
+    cfg_path = os.path.join(HERE, "config.json")        # 页面里「重新配置」保存的设置优先
+    if os.path.isfile(cfg_path):
+        try:
+            saved = json.load(open(cfg_path, encoding="utf-8"))
+            for k, name in (("API_BASE", "api_base"), ("API_KEY", "api_key"), ("MODEL", "model")):
+                if saved.get(name):
+                    CFG[k] = saved[name]
+        except (OSError, ValueError):
+            pass
     return bool(CFG.get("API_BASE") and CFG.get("API_KEY"))
 
 

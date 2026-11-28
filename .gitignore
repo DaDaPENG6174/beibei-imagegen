@@ -2,3 +2,5 @@ __pycache__/
 自检结果/
 *.损坏备份.html
 *备份.html
+config.json
+config.json.tmp
